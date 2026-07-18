@@ -50,7 +50,9 @@ jobs:
         include:
           - { os: ubuntu-24.04, rid: linux-x64, lib: libwhiteout_native.so }
           - { os: ubuntu-24.04-arm, rid: linux-arm64, lib: libwhiteout_native.so }
-          - { os: macos-13, rid: osx-x64, lib: libwhiteout_native.dylib } # Intel
+          # osx-x64 (macos-13 Intel) removed: GitHub's Intel macOS runners queue
+          # for a very long time and gate the whole run. Re-add if an Intel macOS
+          # build is actually needed (osx-arm64 covers Apple Silicon).
           - { os: macos-14, rid: osx-arm64, lib: libwhiteout_native.dylib } # Apple Silicon
     steps:
       - uses: actions/checkout@v4
