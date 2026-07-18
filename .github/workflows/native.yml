@@ -1,0 +1,167 @@
+# Build the flat-C ABI shared library and publish it as a GitHub release asset.
+#
+#   linux-x64 / linux-arm64  →  libwhiteout_native.so
+#   osx-x64   / osx-arm64    →  libwhiteout_native.dylib
+#
+# Downstream consumers (e.g. the modkit VS Code extension) fetch the
+# per-platform binary from the release instead of building it locally, which
+# is how the current Windows bundle already works (whiteout_native.dll +
+# WhiteoutCascExtract.exe) — this workflow extends that model to Linux/macOS.
+#
+# Only the `whiteout_c` target is built (CASC + MPQ enabled) — no Java, Python,
+# pybind11 or WASM bindings — so it stays much leaner than tools/build-ci.sh.
+# Codegen still runs, but only the C-ABI backends; it is a manual pre-step
+# (`python -m tools.codegen.codegen …`), NOT driven by cmake, so it must run
+# before the cmake configure that globs the generated sources.
+#
+# Windows is intentionally omitted: whiteout_native.dll is still produced by
+# the existing llvm-mingw pipeline (its dependent libc++/libunwind/winpthread
+# DLLs differ from an MSVC build, and swapping toolchains would change the set
+# of files the extension bundles). Add a windows leg here only once you've
+# reconciled that dependency set.
+#
+# Triggers:
+#   - Tag push (native-v*):  build + attach the per-rid tarballs to the
+#                            matching GitHub release (created as a draft).
+#   - Manual dispatch:       build + upload workflow artifacts only.
+#
+# NOTE ON GLIBC FLOOR: the Linux legs run on ubuntu-24.04 (glibc 2.39), which
+# bounds the oldest distro the .so will load on. To lower that floor, run the
+# Linux legs inside a manylinux_2_28 container (glibc 2.28) with gcc-toolset-14
+# — the same image tools/.../wheels.yml already uses for Python wheels.
+
+name: native
+
+on:
+  push:
+    tags: ["native-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # upload-release-asset on tag pushes
+
+jobs:
+  build:
+    name: native (${{ matrix.rid }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, rid: linux-x64, lib: libwhiteout_native.so }
+          - { os: ubuntu-24.04-arm, rid: linux-arm64, lib: libwhiteout_native.so }
+          - { os: macos-13, rid: osx-x64, lib: libwhiteout_native.dylib } # Intel
+          - { os: macos-14, rid: osx-arm64, lib: libwhiteout_native.dylib } # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive # externals/zlib-ng
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          # Codegen deps. `libclang` parses the annotated C++ headers; the rest
+          # mirror tools/build-ci.sh's CI install phase. cmake + ninja via pip
+          # keep the versions uniform across runners.
+          python -m pip install pybind11 libclang wheel packaging tomli cmake ninja
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            sudo apt-get update
+            # gcc-14 for C++23; `clang` is needed only so codegen's parser can
+            # shell out to `clang -print-resource-dir` for libclang's builtin
+            # headers (see tools/codegen/parser.py). It does NOT compile the lib.
+            sudo apt-get install -y --no-install-recommends g++-14 clang
+            {
+              echo "CC=gcc-14"
+              echo "CXX=g++-14"
+            } >> "${GITHUB_ENV}"
+          else
+            # macOS: Xcode clang already provides C++23 and `xcrun clang`.
+            # Pin the deployment target to widen backward compatibility.
+            echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Codegen (C ABI backends only)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Verbatim from tools/build-ci.sh's "C ABI" codegen block, minus the
+          # Java/pybind backends this build doesn't compile.
+          modules=(textures mdx m2 m3 utils host mpq casc)
+          python -m tools.codegen.codegen textures --backend c-common-header
+          python -m tools.codegen.codegen textures --backend c-common
+          for mod in "${modules[@]}"; do
+            python -m tools.codegen.codegen "${mod}" --backend c-header
+            python -m tools.codegen.codegen "${mod}" --backend c-source
+          done
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S . -B build-native -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DWHITEOUT_BUILD_C_BINDINGS=ON \
+            -DWHITEOUT_ENABLE_CASC=ON \
+            -DWHITEOUT_ENABLE_MPQ=ON \
+            -DWHITEOUT_BUILD_JNI_BINDINGS=OFF \
+            -DWHITEOUT_BUILD_PYTHON_BINDINGS=OFF \
+            -DWHITEOUT_BUILD_PYTHON_WHEEL=OFF \
+            -DWHITEOUT_BUILD_EXAMPLES=OFF \
+            -DWHITEOUT_BUILD_TESTS=OFF \
+            -DWHITEOUT_WARNINGS_AS_ERRORS=OFF \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.15
+
+      - name: Build whiteout_c
+        run: cmake --build build-native --config Release --target whiteout_c --parallel
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euxo pipefail
+          out="dist/${{ matrix.rid }}"
+          mkdir -p "${out}"
+          lib="$(find build-native -name '${{ matrix.lib }}' -type f | head -n1)"
+          test -n "${lib}" || { echo "FATAL: ${{ matrix.lib }} not produced by the build" >&2; exit 1; }
+          cp "${lib}" "${out}/"
+          ls -lah "${out}/"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.rid }}
+          path: dist/${{ matrix.rid }}/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/native-v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist # each leg lands under dist/native-<rid>/
+
+      - name: Package per-rid tarballs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # The .so/.dylib share a basename across arches, so tar per rid to
+          # keep the release assets from colliding.
+          mkdir -p out
+          for d in dist/native-*; do
+            rid="${d#dist/native-}"
+            tar -C "${d}" -czf "out/whiteout-native-${rid}.tar.gz" .
+          done
+          ls -lah out/
+
+      - name: Attach to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.tar.gz
+          draft: true
+          generate_release_notes: true
