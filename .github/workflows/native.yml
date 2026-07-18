@@ -137,8 +137,94 @@ jobs:
           name: native-${{ matrix.rid }}
           path: dist/${{ matrix.rid }}/*
 
+  # ── musl / glibc-free leg ──────────────────────────────────────────────
+  # Fully static libstdc++/libgcc + musl libc → the .so has NO GLIBC_ version
+  # floor and loads on every Linux (Alpine included). The extension runs
+  # WhiteoutCascExtract as a *subprocess*, so pairing this with a
+  # `dotnet publish -r linux-musl-x64` frontend keeps that process 100%
+  # glibc-free — no two-libc-in-one-address-space hazard.
+  #
+  # Alpine's Python is musl, so the pip `libclang` wheel (manylinux/glibc)
+  # won't import — codegen instead uses the distro's musl-native `py3-clang`.
+  build-musl:
+    name: native (linux-musl-x64)
+    runs-on: ubuntu-24.04
+    container: alpine:3.21 # gcc 14 + clang; matches the glibc leg's toolchain
+    steps:
+      - name: Install toolchain (musl)
+        shell: sh
+        run: |
+          set -eux
+          # bash + git first so the checkout action and bash steps below work
+          # inside the busybox/musl container.
+          apk add --no-cache bash git g++ musl-dev clang clang-dev llvm-dev \
+            cmake samurai python3 py3-clang tar binutils file
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive # externals/zlib-ng (built from source under musl)
+
+      - name: Codegen (C ABI backends only)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          modules=(textures mdx m2 m3 utils host mpq casc)
+          python3 -m tools.codegen.codegen textures --backend c-common-header
+          python3 -m tools.codegen.codegen textures --backend c-common
+          for mod in "${modules[@]}"; do
+            python3 -m tools.codegen.codegen "${mod}" --backend c-header
+            python3 -m tools.codegen.codegen "${mod}" --backend c-source
+          done
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S . -B build-native -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DWHITEOUT_BUILD_C_BINDINGS=ON \
+            -DWHITEOUT_ENABLE_CASC=ON \
+            -DWHITEOUT_ENABLE_MPQ=ON \
+            -DWHITEOUT_BUILD_JNI_BINDINGS=OFF \
+            -DWHITEOUT_BUILD_PYTHON_BINDINGS=OFF \
+            -DWHITEOUT_BUILD_PYTHON_WHEEL=OFF \
+            -DWHITEOUT_BUILD_EXAMPLES=OFF \
+            -DWHITEOUT_BUILD_TESTS=OFF \
+            -DWHITEOUT_WARNINGS_AS_ERRORS=OFF \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.15 \
+            -DCMAKE_CXX_FLAGS="-static-libstdc++ -static-libgcc" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+
+      - name: Build whiteout_c
+        run: cmake --build build-native --config Release --target whiteout_c --parallel
+
+      - name: Stage artifact + assert glibc-free
+        shell: bash
+        run: |
+          set -euxo pipefail
+          out="dist/linux-musl-x64"
+          mkdir -p "${out}"
+          lib="$(find build-native -name libwhiteout_native.so -type f | head -n1)"
+          test -n "${lib}" || { echo "FATAL: libwhiteout_native.so not produced" >&2; exit 1; }
+          cp "${lib}" "${out}/"
+          file "${out}/libwhiteout_native.so"
+          echo "── NEEDED (expect libc.musl-*, NOT libc.so.6) ──"
+          readelf -d "${out}/libwhiteout_native.so" | grep NEEDED || true
+          # Hard gate: any GLIBC_ version symbol means it's not musl-clean.
+          if readelf -V "${out}/libwhiteout_native.so" 2>/dev/null | grep -q 'GLIBC_'; then
+            echo "::error::binary references GLIBC_ version symbols — not musl-clean" >&2
+            exit 1
+          fi
+          echo "musl-clean: no GLIBC_ version symbols present"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-linux-musl-x64
+          path: dist/linux-musl-x64/*
+
   release:
-    needs: build
+    needs: [build, build-musl]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/native-v')
     steps:
