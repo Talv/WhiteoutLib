@@ -123,6 +123,20 @@ public sealed class Storage : WhiteoutHandle
             NativeMethods.whiteout_casc_CascStorage_listFiles_count,
             (h, i) => NativeMethods.whiteout_casc_CascStorage_listFiles_at(h, i).ToManagedString());
 
+    /// <summary>@return Known file paths under a path prefix.</summary>
+    public IReadOnlyList<string> ListFilesPrefix(string prefix) =>
+        new NativeListView<string>(
+            DangerousGet(),
+            h => NativeMethods.whiteout_casc_CascStorage_listFilesPrefix_count(h, prefix),
+            (h, i) => NativeMethods.whiteout_casc_CascStorage_listFilesPrefix_at(h, prefix, i).ToManagedString());
+
+    /// <summary>@return Uncompressed file sizes for known file paths under a path prefix.</summary>
+    public IReadOnlyList<ulong> ListFilesPrefixSizes(string prefix) =>
+        new NativeListView<ulong>(
+            DangerousGet(),
+            h => NativeMethods.whiteout_casc_CascStorage_listFilesPrefix_count(h, prefix),
+            (h, i) => NativeMethods.whiteout_casc_CascStorage_listFilesPrefix_size_at(h, prefix, i));
+
 
     /// <summary>Import encryption keys from a formatted string (one per line).</summary>
     public bool ImportKeysFromString(string keyList)
