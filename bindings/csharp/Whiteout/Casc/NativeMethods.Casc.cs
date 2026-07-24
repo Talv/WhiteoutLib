@@ -142,6 +142,15 @@ internal static partial class NativeMethods
     [LibraryImport(Runtime.LibraryName)]
     internal static partial Whiteout.Common.NativeCString whiteout_casc_CascStorage_listFiles_at(IntPtr self, nuint index);
 
+    [LibraryImport(Runtime.LibraryName)]
+    internal static partial nuint whiteout_casc_CascStorage_listFilesPrefix_count(IntPtr self, [MarshalAs(UnmanagedType.LPUTF8Str)] string prefix);
+
+    [LibraryImport(Runtime.LibraryName)]
+    internal static partial Whiteout.Common.NativeCString whiteout_casc_CascStorage_listFilesPrefix_at(IntPtr self, [MarshalAs(UnmanagedType.LPUTF8Str)] string prefix, nuint index);
+
+    [LibraryImport(Runtime.LibraryName)]
+    internal static partial ulong whiteout_casc_CascStorage_listFilesPrefix_size_at(IntPtr self, [MarshalAs(UnmanagedType.LPUTF8Str)] string prefix, nuint index);
+
 
     [LibraryImport(Runtime.LibraryName)]
     [return: MarshalAs(UnmanagedType.I4)]

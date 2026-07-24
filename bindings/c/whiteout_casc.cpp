@@ -6,9 +6,11 @@
 #include "whiteout_casc.h"
 
 #include <cstring>
+#include <cstdint>
 #include <new>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <whiteout/storages/casc/types.h>
@@ -38,6 +40,71 @@ inline whiteout_CString wrapCString(std::string&& s) {
 
 inline whiteout_CString emptyCString() {
     return { nullptr, 0, nullptr };
+}
+
+using CascStorageNative = whiteout::storages::casc::Storage;
+
+struct CachedCascFileEntry {
+    std::string path;
+    std::uint64_t fileSize = 0;
+};
+
+thread_local std::unordered_map<const CascStorageNative*, std::vector<std::string>> g_cascListFilesCache;
+thread_local std::unordered_map<std::string, std::vector<CachedCascFileEntry>> g_cascListFilesPrefixCache;
+
+const std::vector<std::string>& cachedListFiles(const CascStorageNative* storage, bool refresh) {
+    auto it = g_cascListFilesCache.find(storage);
+    if (refresh || it == g_cascListFilesCache.end()) {
+        it = g_cascListFilesCache.insert_or_assign(storage, storage->listFiles()).first;
+    }
+    return it->second;
+}
+
+std::string prefixCacheKey(const CascStorageNative* storage, std::string_view prefix) {
+    std::string key;
+    key.reserve(32 + prefix.size());
+    key += std::to_string(reinterpret_cast<std::uintptr_t>(storage));
+    key.push_back('\0');
+    key.append(prefix.data(), prefix.size());
+    return key;
+}
+
+std::string normalizePrefixArg(const char* prefix) {
+    std::string out(prefix ? prefix : "");
+    while (!out.empty() && (out.front() == '/' || out.front() == '\\')) out.erase(out.begin());
+    while (!out.empty() && (out.back() == '/' || out.back() == '\\')) out.pop_back();
+    for (char& ch : out) {
+        if (ch == '\\') ch = '/';
+        else if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + 32);
+    }
+    return out;
+}
+
+bool startsWithPrefixPath(std::string_view path, std::string_view prefix) {
+    if (path.size() < prefix.size()) return false;
+    for (size_t i = 0; i < prefix.size(); ++i) {
+        char ch = path[i];
+        if (ch == '\\') ch = '/';
+        else if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + 32);
+        if (ch != prefix[i]) return false;
+    }
+    return path.size() == prefix.size() || path[prefix.size()] == '/' || path[prefix.size()] == '\\';
+}
+
+const std::vector<CachedCascFileEntry>& cachedListFilesPrefix(const CascStorageNative* storage, const char* rawPrefix, bool refresh) {
+    std::string const prefix = normalizePrefixArg(rawPrefix);
+    std::string const key = prefixCacheKey(storage, prefix);
+    auto it = g_cascListFilesPrefixCache.find(key);
+    if (refresh || it == g_cascListFilesPrefixCache.end()) {
+        std::vector<CachedCascFileEntry> files;
+        storage->enumerate(prefix + "/*", [&](const whiteout::storages::casc::EnumerateEntry& entry) {
+            if (!entry.path.empty() && startsWithPrefixPath(entry.path, prefix))
+                files.push_back({ std::string(entry.path), entry.fileSize });
+            return true;
+        });
+        it = g_cascListFilesPrefixCache.insert_or_assign(key, std::move(files)).first;
+    }
+    return it->second;
 }
 
 } // anonymous
@@ -141,7 +208,15 @@ void whiteout_casc_CascWriteOptions_set_compress(whiteout_CascWriteOptions* self
 extern "C" {
 
 void whiteout_casc_CascStorage_delete(whiteout_CascStorage* self) {
-    delete reinterpret_cast<whiteout::storages::casc::Storage*>(self);
+    auto* storage = reinterpret_cast<whiteout::storages::casc::Storage*>(self);
+    g_cascListFilesCache.erase(storage);
+    for (auto it = g_cascListFilesPrefixCache.begin(); it != g_cascListFilesPrefixCache.end();) {
+        if (it->first.rfind(std::to_string(reinterpret_cast<std::uintptr_t>(storage)) + '\0', 0) == 0)
+            it = g_cascListFilesPrefixCache.erase(it);
+        else
+            ++it;
+    }
+    delete storage;
 }
 
 struct whiteout_CascStorage* whiteout_casc_CascStorage_open(const char* path, void* pool) {
@@ -211,13 +286,29 @@ int32_t whiteout_casc_CascStorage_fileExists_fileId_hint(const whiteout_CascStor
 }
 
 size_t whiteout_casc_CascStorage_listFiles_count(const whiteout_CascStorage* self) {
-    return reinterpret_cast<const whiteout::storages::casc::Storage*>(self)->listFiles().size();
+    return cachedListFiles(reinterpret_cast<const whiteout::storages::casc::Storage*>(self), true).size();
 }
 
 whiteout_CString whiteout_casc_CascStorage_listFiles_at(const whiteout_CascStorage* self, size_t index) {
-    const auto& __v = reinterpret_cast<const whiteout::storages::casc::Storage*>(self)->listFiles();
+    const auto& __v = cachedListFiles(reinterpret_cast<const whiteout::storages::casc::Storage*>(self), false);
     if (index >= __v.size()) return emptyCString();
     return wrapCString(std::string(__v[index]));
+}
+
+size_t whiteout_casc_CascStorage_listFilesPrefix_count(const whiteout_CascStorage* self, const char* prefix) {
+    return cachedListFilesPrefix(reinterpret_cast<const whiteout::storages::casc::Storage*>(self), prefix, true).size();
+}
+
+whiteout_CString whiteout_casc_CascStorage_listFilesPrefix_at(const whiteout_CascStorage* self, const char* prefix, size_t index) {
+    const auto& __v = cachedListFilesPrefix(reinterpret_cast<const whiteout::storages::casc::Storage*>(self), prefix, false);
+    if (index >= __v.size()) return emptyCString();
+    return wrapCString(std::string(__v[index].path));
+}
+
+uint64_t whiteout_casc_CascStorage_listFilesPrefix_size_at(const whiteout_CascStorage* self, const char* prefix, size_t index) {
+    const auto& __v = cachedListFilesPrefix(reinterpret_cast<const whiteout::storages::casc::Storage*>(self), prefix, false);
+    if (index >= __v.size()) return 0;
+    return __v[index].fileSize;
 }
 
 int32_t whiteout_casc_CascStorage_importKeysFromString(whiteout_CascStorage* self, const char* keyList) {

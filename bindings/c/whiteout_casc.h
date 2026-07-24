@@ -115,6 +115,9 @@ int32_t whiteout_casc_CascStorage_fileExists_fileId_hint(const whiteout_CascStor
 /* @return All known file paths. */
 size_t whiteout_casc_CascStorage_listFiles_count(const whiteout_CascStorage* self);
 whiteout_CString whiteout_casc_CascStorage_listFiles_at(const whiteout_CascStorage* self, size_t index);
+size_t whiteout_casc_CascStorage_listFilesPrefix_count(const whiteout_CascStorage* self, const char* prefix);
+whiteout_CString whiteout_casc_CascStorage_listFilesPrefix_at(const whiteout_CascStorage* self, const char* prefix, size_t index);
+uint64_t whiteout_casc_CascStorage_listFilesPrefix_size_at(const whiteout_CascStorage* self, const char* prefix, size_t index);
 /* Import encryption keys from a formatted string (one per line). */
 int32_t whiteout_casc_CascStorage_importKeysFromString(whiteout_CascStorage* self, const char* keyList);
 /* Import encryption keys from a file. */
